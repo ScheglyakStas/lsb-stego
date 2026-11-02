@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=LSB-стеганография
+Name[en]=LSB Stego
+GenericName=Стеганография в изображениях
+Comment=Встраивание и извлечение сообщений в изображениях BMP методом LSB
+Comment[en]=Hide and extract messages in BMP images using LSB steganography
+Exec=lsb-stego
+Icon=lsb-stego
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+Keywords=steganography;LSB;BMP;стеганография;
+StartupWMClass=LSB-Stego

@@ -1,0 +1,102 @@
+name: Сборка установщиков и релиз
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  BUILD_DEPS: PySide6-Essentials numpy Pillow pyinstaller
+
+jobs:
+  deb:
+    name: Linux (.deb)
+    # Сборка на 22.04 (glibc 2.35), чтобы пакет работал и на более новых системах.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Системные библиотеки Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 \
+            libxcb-keysyms1 libxcb-shape0 libegl1 libgl1
+      - run: pip install ${{ env.BUILD_DEPS }}
+      - name: Версия
+        shell: bash
+        run: echo "VERSION=$(echo "${GITHUB_REF_NAME}" | sed -E 's/^v//; s/[^0-9A-Za-z.+~-]/-/g; s/^([^0-9])/0~\1/')" >> "$GITHUB_ENV"
+      - run: bash packaging/build_deb.sh "$VERSION"
+      - name: Проверка запуска
+        run: QT_QPA_PLATFORM=offscreen timeout 10 build/pyinstaller/dist/lsb-stego/lsb-stego || test $? -eq 124
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+
+  windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ${{ env.BUILD_DEPS }}
+      - name: Версия
+        shell: bash
+        run: echo "VERSION=$(echo "${GITHUB_REF_NAME}" | sed -E 's/^v//; s/[^0-9A-Za-z.+~-]/-/g')" >> "$GITHUB_ENV"
+      - name: PyInstaller
+        shell: bash
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name lsb-stego
+          --icon "$PWD/assets/icon.ico"
+          --add-data "$PWD/assets/icon.png;assets"
+          --distpath build/pyinstaller/dist
+          --workpath build/pyinstaller/work
+          --specpath build/pyinstaller
+          main.py
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$env:VERSION" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: dist/*.exe
+
+  release:
+    name: Публикация релиза
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deb, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Создание релиза
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## Установка
+
+          - **Windows 10/11 (64 бит):** скачайте `LSB-Stego-Setup-*.exe` и запустите.
+            Установщик не подписан, поэтому SmartScreen может показать предупреждение —
+            «Подробнее» → «Выполнить в любом случае».
+          - **Ubuntu 22.04+ / Debian 12+ (amd64):** скачайте `lsb-stego_*_amd64.deb` и выполните
+            `sudo apt install ./lsb-stego_*_amd64.deb`. Приложение появится в меню как
+            «LSB-стеганография», запуск из терминала — `lsb-stego`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "LSB-стеганография $GITHUB_REF_NAME" --notes-file notes.md
