@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 import lsb_core as core
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # В сборке PyInstaller ресурсы распаковываются в sys._MEIPASS.
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))

@@ -52,14 +52,14 @@ jobs:
         shell: bash
         run: echo "VERSION=$(echo "${GITHUB_REF_NAME}" | sed -E 's/^v//; s/[^0-9A-Za-z.+~-]/-/g')" >> "$GITHUB_ENV"
       - name: PyInstaller
-        shell: bash
+        shell: pwsh
         run: >
           pyinstaller --noconfirm --clean --windowed --name lsb-stego
-          --icon "$PWD/assets/icon.ico"
-          --add-data "$PWD/assets/icon.png;assets"
-          --distpath build/pyinstaller/dist
-          --workpath build/pyinstaller/work
-          --specpath build/pyinstaller
+          --icon "$PWD\assets\icon.ico"
+          --add-data "$PWD\assets\icon.png;assets"
+          --distpath build\pyinstaller\dist
+          --workpath build\pyinstaller\work
+          --specpath build\pyinstaller
           main.py
       - name: Inno Setup
         shell: pwsh
