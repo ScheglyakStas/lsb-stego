@@ -6,10 +6,11 @@ import os
 import sys
 
 import numpy as np
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -21,9 +22,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -31,7 +35,7 @@ from PySide6.QtWidgets import (
 
 import lsb_core as core
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 # В сборке PyInstaller ресурсы распаковываются в sys._MEIPASS.
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +47,8 @@ IMAGE_FILTER = (
     "Изображения BMP (*.bmp);;Все файлы (*)"
 )
 TEXT_FILTER = "Текстовые файлы (*.txt);;Все файлы (*)"
+SAVE_IMAGE_FILTER = "Изображения PNG (*.png);;Изображения BMP (*.bmp)"
+QWIDGETSIZE_MAX = (1 << 24) - 1
 
 
 def to_pixmap(arr: np.ndarray) -> QPixmap:
@@ -195,6 +201,12 @@ class MainWindow(QMainWindow):
         self.stego: np.ndarray | None = None  # результат встраивания
         self.extract_image: np.ndarray | None = None
         self.extract_path = ""
+        self.secret_source: np.ndarray | None = None  # встраиваемое изображение (как загружено)
+        self.secret_data = b""  # оно же после масштабирования и сжатия в PNG
+        self.secret_preview: np.ndarray | None = None
+        self.extracted_image: np.ndarray | None = None
+        self._secret_timer = QTimer(self, singleShot=True, interval=250)
+        self._secret_timer.timeout.connect(self._encode_secret)
 
         splitter = QSplitter()
         splitter.addWidget(self._build_settings_panel())
@@ -297,24 +309,39 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("<b>Сообщение для встраивания:</b>"))
+        row.addWidget(QLabel("<b>Встраиваемые данные:</b>"))
+        self.text_radio = QRadioButton("Текст")
+        self.image_radio = QRadioButton("Изображение")
+        self.text_radio.setChecked(True)
+        self.payload_group = QButtonGroup(self)
+        for i, radio in enumerate((self.text_radio, self.image_radio)):
+            self.payload_group.addButton(radio, i)
+            row.addWidget(radio)
         row.addStretch(1)
-        load_btn = QPushButton("Загрузить из файла…")
-        load_btn.clicked.connect(self.load_message)
-        row.addWidget(load_btn)
+        self.load_text_btn = QPushButton("Загрузить из файла…")
+        self.load_text_btn.clicked.connect(self.load_message)
+        self.open_secret_btn = QPushButton("Открыть изображение…")
+        self.open_secret_btn.setToolTip("Изображение, которое будет скрыто в контейнере")
+        self.open_secret_btn.clicked.connect(self.open_secret)
+        row.addWidget(self.load_text_btn)
+        row.addWidget(self.open_secret_btn)
         layout.addLayout(row)
 
+        self.payload_stack = QStackedWidget()
+        self.payload_stack.setMaximumHeight(160)
         self.message_edit = QPlainTextEdit()
         self.message_edit.setPlaceholderText("Введите текст сообщения…")
         self.message_edit.textChanged.connect(self._update_message_info)
-        self.message_edit.setMaximumHeight(160)
-        layout.addWidget(self.message_edit)
+        self.payload_stack.addWidget(self.message_edit)
+        self.payload_stack.addWidget(self._build_secret_panel())
+        layout.addWidget(self.payload_stack)
+        self.payload_group.idToggled.connect(self._payload_kind_changed)
 
         self.message_info = QLabel()
         layout.addWidget(self.message_info)
 
         row = QHBoxLayout()
-        self.embed_btn = QPushButton("Встроить сообщение")
+        self.embed_btn = QPushButton("Встроить")
         self.embed_btn.clicked.connect(self.do_embed)
         self.save_btn = QPushButton("Сохранить результат…")
         self.save_btn.setEnabled(False)
@@ -344,9 +371,56 @@ class MainWindow(QMainWindow):
             lambda: self._set_zoom(self.embed_zoom, self.original_view.view, self.stego_view.view))
 
         self.metrics_label = QLabel()
+        self.metrics_label.setWordWrap(True)
         layout.addWidget(self.metrics_label)
-        self._update_message_info()
+        self._payload_kind_changed()
         return tab
+
+    def _build_secret_panel(self) -> QWidget:
+        panel = QWidget()
+        row = QHBoxLayout(panel)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.secret_view = ImageView("Изображение не выбрано")
+        self.secret_view.setMinimumSize(240, 120)
+        self.secret_view.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Ignored)
+        row.addWidget(self.secret_view)
+
+        form = QGridLayout()
+        self.secret_info = QLabel("Откройте изображение, которое нужно скрыть.")
+        self.secret_info.setWordWrap(True)
+        form.addWidget(self.secret_info, 0, 0, 1, 3)
+        form.addWidget(QLabel("Масштаб:"), 1, 0)
+        self.secret_scale = QSpinBox()
+        self.secret_scale.setRange(1, 100)
+        self.secret_scale.setValue(100)
+        self.secret_scale.setSuffix(" %")
+        self.secret_scale.valueChanged.connect(lambda: self._secret_timer.start())
+        form.addWidget(self.secret_scale, 1, 1)
+        self.secret_size = QLabel()
+        form.addWidget(self.secret_size, 1, 2)
+        form.addWidget(QLabel("Цвет:"), 2, 0)
+        self.secret_mode = QComboBox()
+        for mode, name in core.SECRET_COLOR_MODES:
+            self.secret_mode.addItem(name, mode)
+        self.secret_mode.currentIndexChanged.connect(self._encode_secret)
+        form.addWidget(self.secret_mode, 2, 1, 1, 2)
+        self.fit_btn = QPushButton("Подогнать под ёмкость")
+        self.fit_btn.setToolTip("Подобрать наибольший масштаб, при котором изображение "
+                                "помещается в контейнер с текущими параметрами")
+        self.fit_btn.clicked.connect(self.fit_secret)
+        form.addWidget(self.fit_btn, 3, 0, 1, 2)
+        form.setColumnStretch(2, 1)
+        form.setRowStretch(4, 1)
+        row.addLayout(form, 1)
+        self._set_secret_controls_enabled(False)
+        return panel
+
+    def _set_secret_controls_enabled(self, enabled: bool) -> None:
+        for w in (self.secret_scale, self.secret_mode, self.fit_btn):
+            w.setEnabled(enabled)
+
+    def image_mode(self) -> bool:
+        return self.image_radio.isChecked()
 
     def _build_extract_tab(self) -> QWidget:
         tab = QWidget()
@@ -369,9 +443,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.extract_view, 1)
 
         row = QHBoxLayout()
-        extract_btn = QPushButton("Извлечь сообщение")
+        extract_btn = QPushButton("Извлечь")
+        extract_btn.setToolTip("Тип данных (текст или изображение) определяется автоматически")
         extract_btn.clicked.connect(self.do_extract)
-        self.save_text_btn = QPushButton("Сохранить текст…")
+        self.save_text_btn = QPushButton("Сохранить результат…")
         self.save_text_btn.setEnabled(False)
         self.save_text_btn.clicked.connect(self.save_extracted)
         row.addWidget(extract_btn)
@@ -379,12 +454,46 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         layout.addLayout(row)
 
-        layout.addWidget(QLabel("<b>Извлечённое сообщение:</b>"))
+        row = QHBoxLayout()
+        self.result_caption = QLabel()
+        row.addWidget(self.result_caption)
+        row.addStretch(1)
+        self.result_zoom_label = QLabel("Масштаб:")
+        self.result_zoom = self._zoom_combo()
+        row.addWidget(self.result_zoom_label)
+        row.addWidget(self.result_zoom)
+        layout.addLayout(row)
+
+        self.result_stack = QStackedWidget()
         self.extracted_edit = QPlainTextEdit()
         self.extracted_edit.setReadOnly(True)
-        self.extracted_edit.setMaximumHeight(180)
-        layout.addWidget(self.extracted_edit)
+        self.extracted_view = ImageView("Нет изображения")
+        self.result_zoom.currentIndexChanged.connect(
+            lambda: self._set_zoom(self.result_zoom, self.extracted_view))
+        self.result_stack.addWidget(self.extracted_edit)
+        self.result_stack.addWidget(self.extracted_view)
+        layout.addWidget(self.result_stack, 1)
+        self._show_result(None)
         return tab
+
+    def _show_result(self, data: str | np.ndarray | None) -> None:
+        """Выводит результат извлечения: текст, изображение или пустое поле (None)."""
+        is_image = isinstance(data, np.ndarray)
+        self.extracted_image = data if is_image else None
+        self.extracted_edit.setPlainText(data if isinstance(data, str) else "")
+        self.extracted_view.set_array(data if is_image else None)
+        self.result_stack.setCurrentIndex(int(is_image))
+        self.result_stack.setMaximumHeight(QWIDGETSIZE_MAX if is_image else 180)
+        self.result_zoom_label.setVisible(is_image)
+        self.result_zoom.setVisible(is_image)
+        if is_image:
+            h, w = data.shape[:2]
+            self.result_caption.setText(f"<b>Извлечённое изображение:</b> {w}×{h} пикс.")
+            self.save_text_btn.setText("Сохранить изображение…")
+        else:
+            self.result_caption.setText("<b>Извлечённое сообщение:</b>")
+            self.save_text_btn.setText("Сохранить текст…" if data is not None else "Сохранить результат…")
+        self.save_text_btn.setEnabled(data is not None)
 
     def _build_planes_tab(self) -> QWidget:
         tab = QWidget()
@@ -444,9 +553,16 @@ class MainWindow(QMainWindow):
     def _update_message_info(self) -> None:
         if not hasattr(self, "message_info"):
             return
-        text = self.message_edit.toPlainText()
-        nbytes = len(text.encode("utf-8"))
-        info = f"Символов: {len(text)}, байт (UTF-8): {nbytes}"
+        if self.image_mode():
+            if self.secret_source is None:
+                self.message_info.setText("Изображение для встраивания не выбрано")
+                return
+            nbytes = len(self.secret_data)
+            info = f"Размер изображения в PNG: {nbytes} байт"
+        else:
+            text = self.message_edit.toPlainText()
+            nbytes = len(text.encode("utf-8"))
+            info = f"Символов: {len(text)}, байт (UTF-8): {nbytes}"
         if self.container is not None:
             channels, planes, skip = self.params()
             cap = core.capacity_bytes(self.container.shape, channels, planes, skip)
@@ -455,6 +571,14 @@ class MainWindow(QMainWindow):
             else:
                 info += f" из {cap} доступных"
         self.message_info.setText(info)
+
+    def _payload_kind_changed(self) -> None:
+        image = self.image_mode()
+        self.payload_stack.setCurrentIndex(int(image))
+        self.load_text_btn.setVisible(not image)
+        self.open_secret_btn.setVisible(image)
+        self.embed_btn.setText("Встроить изображение" if image else "Встроить сообщение")
+        self._update_message_info()
 
     def _update_plane_view(self) -> None:
         sources = (self.container, self.stego, self.extract_image)
@@ -543,19 +667,90 @@ class MainWindow(QMainWindow):
         except (OSError, UnicodeDecodeError) as exc:
             self._error(f"Не удалось прочитать файл (ожидается текст в UTF-8):\n{exc}")
 
+    def open_secret(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть изображение для встраивания",
+                                              self._start_dir(), IMAGE_FILTER)
+        if not path:
+            return
+        try:
+            arr, info, _ = core.load_image(path)
+        except core.StegoError as exc:
+            self._error(str(exc))
+            return
+        self.secret_source = arr
+        # Пометки о преобразовании в BMP здесь не нужны: изображение встраивается как PNG.
+        self.secret_info.setText(f"{os.path.basename(path)}<br>{info.split(' (')[0]}")
+        self._set_secret_controls_enabled(True)
+        self._secret_timer.stop()
+        self._encode_secret()
+
+    def _encode_secret(self) -> None:
+        """Пересчитывает PNG встраиваемого изображения по текущим масштабу и режиму цвета."""
+        if self.secret_source is None:
+            return
+        self._secret_timer.stop()
+        percent = self.secret_scale.value()
+        w, h = core.scaled_size(self.secret_source.shape, percent)
+        self.secret_size.setText(f"→ {w}×{h} пикс.")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.secret_data, self.secret_preview = core.encode_image(
+                self.secret_source, percent, self.secret_mode.currentData())
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.secret_view.set_array(self.secret_preview)
+        self._update_message_info()
+
+    def fit_secret(self) -> None:
+        if self.secret_source is None:
+            return
+        if self.container is None:
+            self._error("Сначала откройте изображение-контейнер.")
+            return
+        channels, planes, skip = self.params()
+        cap = core.capacity_bytes(self.container.shape, channels, planes, skip)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            percent = core.fit_percent(self.secret_source, self.secret_mode.currentData(), cap)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if percent == 0:
+            self._error("Изображение не помещается в контейнер даже при масштабе 1%.\n"
+                        "Выберите режим «Чёрно-белое», добавьте компоненты или плоскости "
+                        "либо возьмите контейнер большего размера.")
+            return
+        self.secret_scale.blockSignals(True)
+        self.secret_scale.setValue(percent)
+        self.secret_scale.blockSignals(False)
+        self._encode_secret()
+        self.statusBar().showMessage(f"Подобран масштаб {percent}%: изображение помещается в контейнер.")
+
     def do_embed(self) -> None:
         if self.container is None:
             self._error("Сначала откройте изображение-контейнер.")
             return
-        message = self.message_edit.toPlainText().encode("utf-8")
-        if not message:
-            self._error("Введите сообщение для встраивания.")
-            return
+        image = self.image_mode()
+        if image:
+            if self.secret_source is None:
+                self._error("Откройте изображение для встраивания.")
+                return
+            if self._secret_timer.isActive():
+                self._encode_secret()
+            message = self.secret_data
+        else:
+            message = self.message_edit.toPlainText().encode("utf-8")
+            if not message:
+                self._error("Введите сообщение для встраивания.")
+                return
         channels, planes, skip = self.params()
         try:
             self.stego = core.embed(self.container, message, channels, planes, skip)
         except core.StegoError as exc:
-            self._error(str(exc))
+            text = str(exc)
+            if image:
+                text = text.replace("Сообщение не помещается", "Изображение не помещается", 1)
+                text += "\n\nУменьшите масштаб изображения или нажмите «Подогнать под ёмкость»."
+            self._error(text)
             return
         self.stego_view.view.set_array(self.stego)
         self.save_btn.setEnabled(True)
@@ -565,13 +760,19 @@ class MainWindow(QMainWindow):
         psnr_text = "∞" if psnr == float("inf") else f"{psnr:.2f} дБ"
         used_bits = (len(message) + 4) * 8
         cap_bits = core.capacity_bits(self.container.shape, channels, planes, skip)
+        if image:
+            h, w = self.secret_preview.shape[:2]
+            what = f"Встроено изображение {w}×{h} пикс. ({len(message)} байт PNG, "
+        else:
+            what = f"Встроено {len(message)} байт ("
         self.metrics_label.setText(
-            f"Встроено {len(message)} байт ({used_bits} бит с заголовком, "
+            f"{what}{used_bits} бит с заголовком, "
             f"{100 * used_bits / cap_bits:.1f}% ёмкости). "
             f"Изменено пикселей: {changed} из {total}. MSE = {mse:.4f}, PSNR = {psnr_text}"
         )
         self._update_plane_view()
-        self.statusBar().showMessage("Сообщение встроено. Сохраните результат в файл BMP.")
+        kind = "Изображение встроено" if image else "Сообщение встроено"
+        self.statusBar().showMessage(f"{kind}. Сохраните результат в файл BMP.")
 
     def save_stego(self) -> None:
         if self.stego is None:
@@ -609,8 +810,7 @@ class MainWindow(QMainWindow):
         self.extract_image = arr
         self.extract_info.setText(info)
         self.extract_view.set_array(arr)
-        self.extracted_edit.clear()
-        self.save_text_btn.setEnabled(False)
+        self._show_result(None)
         self._update_plane_view()
 
     def do_extract(self) -> None:
@@ -620,10 +820,16 @@ class MainWindow(QMainWindow):
         channels, planes, skip = self.params()
         try:
             data = core.extract(self.extract_image, channels, planes, skip)
+            if core.is_image_payload(data):
+                image = core.decode_image(data)
         except core.StegoError as exc:
-            self.extracted_edit.clear()
-            self.save_text_btn.setEnabled(False)
+            self._show_result(None)
             self._error(str(exc))
+            return
+        if core.is_image_payload(data):
+            self._show_result(image)
+            h, w = image.shape[:2]
+            self.statusBar().showMessage(f"Извлечено изображение {w}×{h} пикс. ({len(data)} байт PNG).")
             return
         try:
             text = data.decode("utf-8")
@@ -632,13 +838,16 @@ class MainWindow(QMainWindow):
             text = data.decode("utf-8", errors="replace")
             QMessageBox.information(
                 self, "Внимание",
-                f"Извлечено {len(data)} байт, но они не являются корректным текстом UTF-8.\n"
+                f"Извлечено {len(data)} байт, но они не являются ни корректным текстом UTF-8, "
+                "ни изображением.\n"
                 "Возможно, параметры извлечения не совпадают с параметрами встраивания.",
             )
-        self.extracted_edit.setPlainText(text)
-        self.save_text_btn.setEnabled(True)
+        self._show_result(text)
 
     def save_extracted(self) -> None:
+        if self.extracted_image is not None:
+            self._save_extracted_image()
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить текст", self._start_dir(), TEXT_FILTER)
         if not path:
             return
@@ -647,6 +856,20 @@ class MainWindow(QMainWindow):
                 f.write(self.extracted_edit.toPlainText())
         except OSError as exc:
             self._error(f"Не удалось сохранить файл:\n{exc}")
+
+    def _save_extracted_image(self) -> None:
+        default = os.path.join(self._start_dir(), "extracted.png")
+        path, selected = QFileDialog.getSaveFileName(self, "Сохранить изображение", default, SAVE_IMAGE_FILTER)
+        if not path:
+            return
+        if not path.lower().endswith((".png", ".bmp")):
+            path += ".bmp" if "BMP" in selected else ".png"
+        try:
+            core.save_image(self.extracted_image, path)
+        except (OSError, ValueError) as exc:
+            self._error(f"Не удалось сохранить файл:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Изображение сохранено: {path}")
 
 
 def main() -> None:

@@ -36,9 +36,9 @@ Depends: libc6 (>= 2.35), libgl1, libegl1, libfontconfig1, libxkbcommon0, libxkb
 Maintainer: ScheglyakStas <ScheglyakStas@users.noreply.github.com>
 Homepage: https://github.com/ScheglyakStas/lsb-stego
 Description: LSB-стеганография в изображениях BMP
- Приложение для встраивания текстовых сообщений в изображения BMP методом
- замены младших битов (LSB) с выбором цветовых компонент, битовых плоскостей
- (1-4) и интервала встраивания, а также для их извлечения.
+ Приложение для встраивания текстовых сообщений и изображений в изображения
+ BMP методом замены младших битов (LSB) с выбором цветовых компонент, битовых
+ плоскостей (1-4) и интервала встраивания, а также для их извлечения.
 EOF
 
 find "$PKG" -type d -exec chmod 755 {} +

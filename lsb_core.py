@@ -5,11 +5,16 @@
 внутри компоненты — выбранные битовые плоскости от младшей к старшей.
 
 Формат полезной нагрузки: 32-битная длина сообщения в байтах (big-endian),
-затем сами байты сообщения.
+затем сами байты сообщения. Текст записывается в UTF-8, изображение — в виде
+файла PNG (сжатие без потерь). Файл PNG начинается с байта 0x89, с которого не
+может начинаться корректный текст UTF-8, поэтому тип данных при извлечении
+определяется однозначно, а стегоконтейнеры с текстом прежних версий читаются
+как раньше.
 """
 
 from __future__ import annotations
 
+import io
 import math
 
 import numpy as np
@@ -201,6 +206,89 @@ def extract(arr: np.ndarray, channels, planes, skip: int) -> bytes:
     n_pix = math.ceil(total / per_pixel)
     bits = _read_bits(flat, all_idx[:n_pix], channels, planes)[HEADER_BITS:total]
     return np.packbits(bits).tobytes()
+
+
+# ---------------------------------------------------------------- встраивание изображений
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+# (режим Pillow, подпись)
+SECRET_COLOR_MODES = (
+    ("RGB", "Полноцветное (24 бит)"),
+    ("L", "Оттенки серого (8 бит)"),
+    ("1", "Чёрно-белое (1 бит)"),
+)
+
+
+def scaled_size(shape, percent: int) -> tuple[int, int]:
+    """Размер (ширина, высота) изображения после масштабирования в процентах."""
+    h, w = shape[:2]
+    return max(1, round(w * percent / 100)), max(1, round(h * percent / 100))
+
+
+def encode_image(arr: np.ndarray, percent: int = 100, mode: str = "RGB") -> tuple[bytes, np.ndarray]:
+    """Готовит изображение к встраиванию: масштабирует, приводит к режиму mode
+    и сжимает в PNG. Возвращает байты PNG и RGB-массив того, что будет встроено."""
+    if not 1 <= percent <= 100:
+        raise StegoError("Масштаб встраиваемого изображения должен быть от 1 до 100%.")
+    if mode not in dict(SECRET_COLOR_MODES):
+        raise StegoError("Недопустимый режим цвета встраиваемого изображения.")
+    img = Image.fromarray(np.ascontiguousarray(arr), "RGB")
+    size = scaled_size(arr.shape, percent)
+    if size != img.size:
+        img = img.resize(size, Image.Resampling.LANCZOS)
+    img = img.convert(mode)
+    buf = io.BytesIO()
+    # Уровень 6: почти то же сжатие, что и 9, но во много раз быстрее на крупных фото.
+    img.save(buf, format="PNG", compress_level=6)
+    return buf.getvalue(), np.array(img.convert("RGB"), dtype=np.uint8)
+
+
+def fit_percent(arr: np.ndarray, mode: str, capacity: int) -> int:
+    """Наибольший масштаб (1–100%), при котором PNG помещается в capacity байт; 0 — не помещается."""
+    def size(p: int) -> int:
+        return len(encode_image(arr, p, mode)[0])
+
+    full = size(100)
+    if full <= capacity:
+        return 100
+    # Размер PNG примерно пропорционален площади — сужаем поиск оценкой.
+    guess = 100 * math.sqrt(capacity / full)
+    lo, hi = max(1, int(guess * 0.8)), min(100, math.ceil(guess * 1.25))
+    if size(lo) > capacity:
+        lo = 1
+        if size(1) > capacity:
+            return 0
+    if hi <= lo or size(hi) <= capacity:
+        hi = 100
+    while hi - lo > 1:  # size(lo) помещается, size(hi) — нет
+        mid = (lo + hi) // 2
+        if size(mid) <= capacity:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def is_image_payload(data: bytes) -> bool:
+    return data.startswith(PNG_SIGNATURE)
+
+
+def decode_image(data: bytes) -> np.ndarray:
+    """Восстанавливает изображение из извлечённых байтов PNG (RGB-массив)."""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            return np.ascontiguousarray(np.array(img.convert("RGB"), dtype=np.uint8))
+    except Exception as exc:  # noqa: BLE001
+        raise StegoError(f"Извлечённые данные похожи на изображение PNG, но повреждены: {exc}") from exc
+
+
+def save_image(arr: np.ndarray, path: str) -> None:
+    """Сохраняет RGB-массив; формат выбирается по расширению (PNG по умолчанию)."""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    fmt = "BMP" if ext in ("bmp", "dib") else "PNG"
+    Image.fromarray(np.ascontiguousarray(arr), "RGB").save(path, format=fmt)
 
 
 def bit_plane(arr: np.ndarray, channel: int, plane: int) -> np.ndarray:
